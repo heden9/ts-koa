@@ -1,24 +1,91 @@
 import * as Koa from "koa";
+import * as path from "path";
 import * as fs from "fs";
+import { promisify } from 'util';
 import * as Router from "koa-router";
 import { bp } from "./blueprint";
 import { BaseContext } from "koa";
+import logger from "./logger";
+const readDir = promisify(fs.readdir);
+const HASLOADED = Symbol('hasloaded')
 
-
-export default class Loader {
+interface SubString {
+  isFound: boolean,
+  source: string
+}
+interface FileModule {
+  module: any,
+  filename: string
+}
+export class Loader {
   router: Router = new Router;
-  controller: any = {};
   app: Koa;
   constructor(app: Koa){
     this.app = app;
   }
+  private appDir(): string {
+    const subString = removeString(__dirname, 'node_modules');
+    if (subString.isFound) {
+      return subString.source
+    }
+    return subString.source.slice(0, -4) + '/';
+  }
 
+  private fileLoader(url: string): Promise<Array<FileModule>> {
+    const merge = this.appDir() + url;
+    return readDir(merge).then(dirs => {
+      return dirs.map(name => {
+        return {
+          module: require(merge + '/' + name).default,
+          filename: name,
+        }
+      })
+    }).catch(e => {
+      logger.error(`目录${url}不存在`);
+      return [];
+    })
+  }
+
+  private loadToContext(target: Array<FileModule>, app: Koa, property: string) {
+    Object.defineProperty(app.context, property, {
+      get(){
+        if (!(<any>this)[HASLOADED]){
+          (<any>this)[HASLOADED] = {};
+        }
+        const loaded = (<any>this)[HASLOADED];
+        if (!loaded[property]){
+          loaded[property] = {};
+          target.forEach((item: FileModule) => {
+            const { filename, module: _class } = item;
+            const [name] = filename.split('.');
+            if (_class){
+              loaded[property][name] = new _class(this, app);
+            }
+          })
+        }
+        return loaded[property];
+      }
+    })
+  }
+  /**
+   * 装载 src/extends/*
+   */
+  loadPlugin() {
+    const pDir = this.appDir() + 'app/config/plugin.js';
+    const pluginModule = require(pDir);
+    Object.keys(pluginModule).forEach(key => {
+      if (pluginModule[key].enable) {
+        const plugin = require(path.join(this.appDir(), 'app/config', pluginModule[key].packagePath)).default;
+        plugin(this.app);
+      }
+    })
+  }
   /**
    * 装载 src/config/config.[default|dev|pro].js
    */
   loadConfig() {
-    const configDef = __dirname + '/config/config.default.js';
-    const configEnv = __dirname + (process.env.NODE_ENV === 'production' ? '/config/config.pro.js' : '/config/config.dev.js');
+    const configDef = this.appDir() + 'app/config/config.default.js';
+    const configEnv = this.appDir() + (process.env.NODE_ENV === 'production' ? 'app/config/config.pro.js' : 'app/config/config.dev.js');
     const conf = require(configDef).default || require(configDef);
     const confDef = require(configEnv).default || require(configEnv);
     const merge = Object.assign({}, conf, confDef);
@@ -32,58 +99,21 @@ export default class Loader {
    * 装载 src/service/*
    * this.ctx.service.[文件名].[方法名] 对于每一个ctx也需要有唯一的service
    */
-  loadService() {
-    const dirs = fs.readdirSync(__dirname + '/service');
-    const that = this;
-    Object.defineProperty(this.app.context, 'service', {
-      get(){
-        if (!(<any>this).cache){
-          (<any>this).cache = {};
-        }
-        const loaded = (<any>this).cache;
-        if (!loaded.service){
-          loaded.service = {};
-          dirs.forEach((filename: string) => {
-            const [name] = filename.split('.');
-            const _class = require(__dirname + '/service/' + filename).default;
-            if (_class){
-              loaded.service[name] = new _class(this, that.app);
-            }
-          })
-        }
-        return loaded.service;
-      }
-    })
+  async loadService() {
+    const modules = await this.fileLoader('app/service');
+    this.loadToContext(modules, this.app, 'service');
   }
   /**
    * 装载 src/controller/*
    */
-  loadController() {
-    const dirs = fs.readdirSync(__dirname + '/controller');
-    dirs.forEach((filename: string) => {
-      require(__dirname + '/controller/' + filename).default
-    });
+  async loadController() {
+    await this.fileLoader('app/controller');
   }
 
   /**
    * 装载 src/router.ts
    */
   loadRouter() {
-    this.loadConfig();
-    this.loadController();
-    this.loadService();
-
-    /*const configHandle = require(__dirname + '/router.js');
-    const routers = configHandle(this.controller);
-    Object.keys(routers).forEach((key: string) => {
-      const [method, path] = key.split(' ');
-      (<any>this.router)[method](path , async (ctx: BaseContext) => {
-        const _class = routers[key].type;
-        const handler = routers[key].methodNames;
-        const instance = new _class(ctx, this.app); // 保证每一次请求，都有一个新的ctrl对象
-        instance[handler]();
-      })
-    });*/
     const r = bp.getRoute();
     Object.keys(r).forEach((url: string) => {
       r[url].forEach((object) => {
@@ -94,6 +124,31 @@ export default class Loader {
       })
     })
 
-    return this.router.routes();
+    this.app.use(this.router.routes());
+  }
+  async load() {
+    try {
+      this.loadPlugin();
+      this.loadConfig();
+    } catch(e) {
+      logger.error(e);
+    }
+    await this.loadController();
+    await this.loadService();
+    this.loadRouter(); // 依赖
+  }
+}
+
+function removeString(source: string, str: string): SubString {
+  const index = source.indexOf(str);
+  if (index > 0) {
+    return {
+      isFound: true,
+      source: source.substr(0, index)
+    }
+  }
+  return {
+    isFound: false,
+    source
   }
 }
